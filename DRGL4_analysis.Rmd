@@ -1,0 +1,399 @@
+---
+title: "IBS DRG samples analysis"
+author: "Sushma Nagaraj"
+date: "9/8/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(PCAtools)
+  library(stringr)
+  library(reshape2)
+  library(ggplot2)
+  library(EDASeq)
+  library(RUVSeq)
+  library(RColorBrewer)
+  library("IHW")
+  library(DOSE)
+  library(clusterProfiler)
+  #library(pathview)
+  library(org.Mm.eg.db)
+  library(biomaRt)
+  library(fgsea)
+})
+here::i_am("src/IBS/DRGL4_analysis.Rmd")
+```
+
+```{r}
+library(tximport)
+library(SummarizedExperiment)
+
+dds <- readRDS(here::here("dds.unfiltered.novogene.rds")) #Novogene counts
+dds$Gender2[dds$Sample == "A121"] <- "F"
+metadata <- colData(dds)
+
+salmonpath <- "/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/requantification_salmon"
+metadata$files <- file.path(salmonpath, metadata$Sample, "transcripts_quant/quant.sf")
+
+files <- metadata$files
+names(files) <- metadata$Sample
+all(file.exists(files))
+
+library(GenomicFeatures)
+mm.ens <- makeTxDbFromGFF(file = "/data/users/sushmanagaraj/ref/mm/vM25/gencode.vM25.annotation.gtf.gz", format = "gtf")
+k <- keys(mm.ens, keytype = "TXNAME")
+tx2gene <- select(mm.ens, keys = k,  columns = "GENEID", keytype = "TXNAME")
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+saveRDS(txi, file = here("data", "IBS.salmon_requantification_summarized_to_gene.txi.rds"))
+txi <- readRDS(file = here("data", "IBS.salmon_requantification_summarized_to_gene.txi.rds"))
+all(colnames(txi$counts) == rownames(metadata))
+dds <- DESeqDataSetFromTximport(txi, metadata, ~group)
+
+dds.full <- dds
+library(rtracklayer)
+mm.ann <- import("/data/users/sushmanagaraj/ref/mm/vM25/gencode.vM25.annotation.gtf.gz", format = "gtf")
+mm.ann <- as.data.frame(mm.ann)
+mm.ann <- mm.ann[mm.ann$type == "gene", ]
+mm.ann <- mm.ann[mm.ann$gene_id %in% rownames(dds.full), ]
+rownames(mm.ann) <- mm.ann$gene_id
+mm.ann <- mm.ann[rownames(dds.full), ]
+all(mm.ann$gene_id == rownames(dds.full))
+rowData(dds.full) <- mm.ann
+saveRDS(dds.full, here("data", "dds.salmon_requantification_summarized_to_gene.rds"))
+dds.full <- readRDS(here("data", "dds.salmon_requantification_summarized_to_gene.rds"))
+
+GTF <- import.gff("/data/users/sushmanagaraj/ref/mm/vM25/gencode.vM25.annotation.gtf.gz", format="gtf", genome="GRCm38.71", feature.type="exon")
+grl <- reduce(split(GTF, elementMetadata(GTF)$gene_id))
+reducedGTF <- unlist(grl, use.names=T)
+elementMetadata(reducedGTF)$gene_id <- rep(names(grl), elementNROWS(grl))
+elementMetadata(reducedGTF)$widths <- width(reducedGTF)
+
+calc_GC_length <- function(x) {
+    #nGCs = sum(elementMetadata(x)$nGCs)
+    width = sum(elementMetadata(x)$widths)
+    #c(width, nGCs/width)
+}
+
+output <- t(sapply(split(reducedGTF, elementMetadata(reducedGTF)$gene_id), calc_GC_length))
+output <- output[1,]
+output <- output[rownames(dds.full)]
+all(names(output) == rownames(dds.full))
+rowData(dds.full)$gene_length <- output
+```
+
+```{r}
+dds.full <- readRDS(here::here("data", "dds.salmon_requantification_summarized_to_gene.rds"))
+```
+
+```{r}
+group <- "DRGL4"
+```
+
+```{r}
+dds <- dds.full[ ,dds.full$source == "DRG L4-S2"]
+gender <- "combined"
+
+#Females
+dds <- dds.full[ ,dds.full$source == "DRG L4-S2" & dds.full$Gender2 == "F"]
+gender <- "Females"
+
+#Males
+dds <- dds.full[ ,dds.full$source == "DRG L4-S2" & dds.full$Gender2 == "M"]
+gender <- "Males"
+
+table(dds$Gender2, dds$group)
+```
+
+```{r}
+rowData(dds)$chr <- rowData(dds)$seqnames
+rowData(dds) <- rowData(dds)[,-which(colnames(rowData(dds)) %in% c("seqnames", "ranges", "strand", "start", "end", "width"))] #These rows are throwing an error
+
+rld <- rlog(dds)
+p <- pca(assay(rld), metadata = colData(rld))
+biplot(p, colby = "group", shape = "Gender2", lab = p$metadata$Sample, labSize = 3, pointSize = 3, legendPosition = 'right', title = "Control vs. IBS Rlog normalization")
+biplot(p, colby = "Extraction.Date", shape = "group", lab = p$metadata$Sample, labSize = 3, pointSize = 3, legendPosition = 'right', title = "Extraction date")
+biplot(p, colby = "Cage", shape = "group", lab = p$metadata$Sample, labSize = 3, pointSize = 3, legendPosition = 'right', title = "Cage")
+biplot(p, colby = "Sac.Date", shape = "group", lab = p$metadata$Sample, labSize = 3, pointSize = 3, legendPosition = 'right', title = "Sac date")
+
+```
+
+#Filter pseudo genes, predicted genes, mitochondrial genes.
+```{r , echo=FALSE}
+pg <- grep("protein_coding", rowData(dds)$gene_type)
+length(pg)
+dds <- dds[pg, ]
+mt <- which(rowData(dds)$chr == "chrM")
+dds <- dds[-mt]
+```
+
+
+```{r}
+set <- newSeqExpressionSet(as.matrix(counts(dds)), phenoData = data.frame(dds$group, row.names = colnames(counts(dds))), featureData = as.data.frame(rowData(dds)))
+
+for(i in 1:ncol(set)){
+  biasPlot(set[,c(1:i)], "gene_length", log=TRUE, ylim = c(0,10), main = colnames(set)[i])
+}
+```
+
+```{r}
+#DRG L4-S2
+#outlier <- "B549"
+#dds <- dds[,!dds$Sample %in% outlier]
+```
+
+```{r}
+keep <- apply(counts(dds), 1, function(x) length(x[x>5]) >= 2)
+dds <- dds[keep, ]
+dds <- estimateSizeFactors(dds)
+norm <- counts(dds, normalized = TRUE)
+```
+
+```{r}
+
+colors <- brewer.pal(8, "Set2")
+colLib <- colors[dds$group]
+boxplot(log2(norm + 1), col = colLib, las = 2)
+plotRLE(norm, col = colLib, outline = FALSE, ylim = c(-0.4, 0.4), las = 2)
+plotPCA(norm, col = colLib, main = "DESeq2 normalization")
+
+genes <- rownames(norm)
+differences <- makeGroups(dds$group)
+differences
+
+ite <- min(8, nrow(colData(dds))-1) 
+for(i in 1:ite) {
+  n.k <- i
+  s <- RUVs(round(norm), genes, k=n.k, differences)
+  plotRLE(s$normalizedCounts, outline = FALSE, ylim = c(-2, 2), col=colLib, main = paste0("RUVs k=", n.k), las = 2)
+  plotPCA(s$normalizedCounts, col=colLib, cex=1.2, main = paste0("RUVs k=", n.k))
+}
+
+n.k <- 7 #DRGL4 combined
+n.k <- 3 #DRGL4 Females
+n.k <- 2 #DRGL4 Males
+
+s <- RUVs(round(norm), genes, k=n.k, differences)
+plotRLE(s$normalizedCounts, outline = FALSE, ylim = c(-2, 2), col=colLib, main = paste0("RUVs k=", n.k), las = 2)
+plotPCA(s$normalizedCounts, col=colLib, cex=1.2, main = paste0("RUVs k=", n.k))
+s$W
+all(rownames(s$W) == rownames(colData(dds)))
+colData(dds) <- cbind(colData(dds), s$W)
+d <- as.formula(paste0("~", paste(paste(paste0("W_", 1:n.k), collapse = " + "), "group", sep = " + ")))
+d
+design(dds) <- d
+
+dds <- DESeq(dds)
+res <- results(dds)
+hist(res$pvalue)
+summary(res)
+DESeq2::plotMA(dds)
+
+res$gene_name <- rowData(dds)$gene_name
+resOrd <- res[order(res$pvalue), ]
+ihwRes <- ihw(pvalue ~ baseMean,  data = as.data.frame(resOrd), alpha = 0.1)
+resOrd$ihw <- adj_pvalues(ihwRes)
+table(resOrd$ihw <= 0.1)
+result0.1 <- resOrd[resOrd$ihw <= 0.1, ]
+resOrd$geneID <- str_sub(rownames(resOrd), 1, 18)
+
+plot(result0.1$log2FoldChange, -log10(result0.1$ihw), xlim = c(-2, 2))
+text(result0.1$log2FoldChange, -log10(result0.1$ihw), labels = result0.1$gene_name)
+
+result15perfdr <- resOrd[resOrd$ihw <= 0.15, ] #For Control vs IBS
+resup <- result15perfdr[result15perfdr$log2FoldChange > 0, ]
+resdown <- result15perfdr[result15perfdr$log2FoldChange < 0, ]
+
+
+write.csv(result15perfdr, file = file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0(group, ".", gender, ".RUVs.DE_genes.padj15per.txt")))
+write.csv(resOrd, file = file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0(group, ".", gender, ".RUVs.DE_analysis.txt")))
+save(s, dds, file = file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, "norm_matrix_dds.RData"))
+```
+
+#GO analysis
+```{r,echo=FALSE,fig.height=10,fig.width=10}
+#fullresult <- result15perfdr
+#fullresult <- resup
+fullresult <- resdown
+allOE_genes <- as.character(resOrd$geneID)
+sigOE_genes <- as.character(fullresult$geneID)
+ego <- enrichGO(gene = sigOE_genes, 
+                universe = allOE_genes,
+                keyType = "ENSEMBL",
+                OrgDb = org.Mm.eg.db, 
+                ont = "ALL", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.05, 
+                readable = TRUE)
+
+cluster_summary <- data.frame(ego)
+#set <- ""
+#set <- "up"
+set <- "down"
+write.csv(cluster_summary, file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("GO_analysis.", group, "." , gender, ".", set, ".csv")))
+pdf(file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group,  gender, paste0("GO_analysis_plots.", group, ".", gender, ".", set, ".pdf")), width = 15)
+dotplot(ego, showCategory = 50)
+x2 <- enrichplot::pairwise_termsim(ego) 
+emapplot(x2)
+#emapplot(ego, showCategory = 50)
+#OE_foldchanges <- fullresult$log2FoldChange
+#names(OE_foldchanges) <- fullresult$geneID
+#cnetplot(ego, 
+#         categorySize="pvalue", 
+#         showCategory = 15, 
+#         foldChange=OE_foldchanges, 
+#         vertex.label.font=5)
+dev.off()
+```
+
+#GSEA Analysis
+```{r echo=FALSE, eval=FALSE}
+#fgsea
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", "dataset" = "mmusculus_gene_ensembl", host = "useast.ensembl.org")
+bm <- getBM(attributes=c("ensembl_gene_id", "hsapiens_homolog_associated_gene_name"), filters = "ensembl_gene_id",  values = resOrd$geneID, mart=mart)
+bm <- bm[!duplicated(bm$ensembl_gene_id), ]
+bm$hsapiens_homolog_associated_gene_name[bm$hsapiens_homolog_associated_gene_name == ""] <- NA
+resOrd$human <- bm[match(resOrd$geneID, bm$ensembl_gene_id), "hsapiens_homolog_associated_gene_name"]
+res2 <- resOrd[,c("human", "stat")]
+res2 <- res2[!is.na(res2$human), ]
+res2 <- res2[!duplicated(res2$human), ]
+
+ranks <- res2$stat
+names(ranks) <- res2$human
+pathways.hallmark <- gmtPathways("/data/users/sushmanagaraj/ref/MSigDB/h.all.v7.2.symbols.gmt")
+fgseaRes <- fgsea(pathways=pathways.hallmark, stats=ranks)
+fgseaRestidy <- fgseaRes[order(fgseaRes$NES, decreasing = TRUE), ]
+pdf(file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control/",  group, gender, paste0("fgsea_analysis_plots.hallmark_pathways.", group, ".", gender, ".pdf")))
+ggplot(fgseaRestidy, aes(reorder(pathway, NES), NES)) + geom_col(aes(fill=padj<0.05)) + coord_flip() + labs(x="Pathway", y="Normalized Enrichment Score", title="Hallmark pathways NES from GSEA") + theme_minimal()
+dev.off()
+
+
+pathways.kegg <- gmtPathways("/data/users/sushmanagaraj/ref/MSigDB/c2.cp.kegg.v7.2.symbols.gmt")
+keggRes <- fgsea(pathways = pathways.kegg, ranks)
+keggRestidy <-  keggRes[order(keggRes$NES, decreasing = TRUE), ]
+pdf(file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("fgsea_analysis_plots.kegg_pathways.", group, ".", gender, ".pdf")), height = 20, width = 10)
+ggplot(keggRestidy, aes(reorder(pathway, NES), NES)) + geom_col(aes(fill=padj<0.05)) + coord_flip() + labs(x="Pathway", y="Normalized Enrichment Score", title="Kegg pathways NES from GSEA") + theme_minimal()
+dev.off()
+#pdf("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/troubleshooting/IBS-vs-Control/DRGT12/Females/fgsea_enrichment_plot.kegg_tgf_beta_signaling.DRGT12.females.normal.pdf")
+#plotEnrichment(pathways.kegg[["KEGG_TGF_BETA_SIGNALING_PATHWAY"]], ranks) 
+#plotEnrichment(pathways.kegg[["KEGG_AXON_GUIDANCE"]], ranks) + labs(title = "AXON_GUIDANCE")
+#dev.off()
+plotEnrichment(pathways.hallmark[["HALLMARK_TNFA_SIGNALING_VIA_NFKB"]], ranks) + labs(title = "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+topPathwaysUp <- keggRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- keggRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+pdf(file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("fgsea_gseatable.kegg_pathways.", group, ".", gender, ".pdf")), width = 15)
+plotGseaTable(pathways.kegg[topPathways], ranks, keggRes, gseaParam=0.5)
+dev.off()
+
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+pdf(file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("fgsea_gseatable.hallmark_pathways.", group, ".", gender, ".pdf")), width = 15)
+plotGseaTable(pathways.hallmark[topPathways], ranks, fgseaRes, gseaParam=0.5)
+dev.off()
+
+library(data.table)
+fwrite(keggRestidy[keggRestidy$padj < 0.1, ], file=file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("fgsea_analysis.kegg_pathways.", group, ".", gender, ".txt")), sep="\t", sep2=c("", " ", ""))
+fwrite(fgseaRestidy[fgseaRestidy$padj < 0.1, ], file=file.path("/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/Reanalysis_with_Salmon_quantification/IBS-vs-Control", group, gender, paste0("fgsea_analysis.hallmark_pathways.", group, ".", gender, ".txt")), sep="\t", sep2=c("", " ", ""))
+```
+
+#Plotting function
+```{r}
+load(here("Reanalysis_with_Salmon_quantification", "IBS-vs-Control", "DRGL4", "combined", "norm_matrix_dds.RData"))
+
+#Prepare the normalized matrix
+all(rownames(dds) == rownames(s$normalizedCounts))
+table(duplicated(rowData(dds)$gene_name))
+rowData(dds)$gene_name_uniq <- rowData(dds)$gene_name
+rowData(dds)$gene_id_trimmed <- str_sub(rowData(dds)$gene_id, 1, 18)
+rowData(dds)$gene_name_uniq[which(duplicated(rowData(dds)$gene_name))] <- paste0(rowData(dds)$gene_name[which(duplicated(rowData(dds)$gene_name))], "_",  rowData(dds)$gene_id_trimmed[which(duplicated(rowData(dds)$gene_name))])
+rownames(s$normalizedCounts) <- rowData(dds)$gene_name_uniq
+
+genes_to_plot <- c("Gap43", "Scn7a", "Scn1a", "Stmn3", "Sncg", "Nrxn3", "Nes")
+pdf(here("Reanalysis_with_Salmon_quantification", "IBS-vs-Control", "DRGL4", "combined", "boxplots_of_interesting_genes.pdf"))
+plot_genes(genes_to_plot)
+dev.off()
+
+plot_genes <- function(gene_to_plot) {
+  #name1 <- sapply(gene_to_plot, function(x) { rownames(dds)[grep(x, rownames(dds))] })
+  mydata <- as.data.frame(s$normalizedCounts[rownames(s$normalizedCounts) %in% gene_to_plot, ])
+  mydata <- t(mydata)
+  pmelt <- melt(mydata)
+  colnames(pmelt) <- c("sample", "gene", "normalized_count")
+  pmelt$group <- colData(dds)[match(pmelt$sample, dds$Sample), "group"]
+  ggplot(pmelt, aes(x = group, y = normalized_count)) + geom_boxplot(aes(fill = group), outlier.shape = NA) + geom_point(aes(x = group, y = normalized_count), position = "jitter", size = 1) + facet_wrap(pmelt$gene, scales = "free_y") + theme_classic() + theme(axis.text.x = element_text(angle = 90)) + ggtitle("DRG L4-S2")
+}
+```
+
+```{r}
+group <- "DRGL4"
+
+path <- here("Reanalysis_with_Salmon_quantification", "IBS-vs-Control")
+
+gender <- "Females"
+female <- read.csv(file.path(path, group, gender, paste0(group, ".", gender, ".RUVs.DE_genes.padj15per.txt")))
+femaleord <- female[order(female$pvalue), ]
+#femaletop50 <- femaleord[1:50, "Gene_name"]
+
+gender <- "combined"
+all <- read.csv(file.path(path, group, gender, paste0(group, ".all.RUVs.DE_genes.padj15per.txt")))
+allord <- all[order(all$pvalue), ]
+#alltop50 <- allord[1:50, "Gene_name"]
+
+#library(VennDiagram)
+#Proximal and Distal Colon.
+#venn.diagram(list(male = maletop50, female = femaletop50, all = alltop50), main = "Ileum vs Duodenum Top 50 genes", filename = #"/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/troubleshooting/venn.ileum-vs-duodenum.top50.tiff")
+#venn.diagram(list(male = maleord$Gene_name, female = femaleord$Gene_name, all = allord$Gene_name), main = "Distal Colon vs. Ileum all DE #genes (FDR <= 0.1, LFC > |0.5|)", filename = #"/data/users/sushmanagaraj/projects/rnaseq/IBS_GABA/analysis/troubleshooting/venn.distal_colon-vs-ileum.all_DE_genes.tiff")
+
+#mtop50 <- data.frame(gene_name = maletop50, analysis = rep("males_only", length(maletop50)))
+#ftop50 <- data.frame(gene_name = femaletop50, analysis = rep("females_only", length(femaletop50)))
+#atop50 <- data.frame(gene_name = alltop50, analysis = rep("combined", length(alltop50)))
+
+colnames(femaleord) <- paste0("females.", colnames(femaleord))
+colnames(femaleord)[1] <- "GeneID"
+colnames(allord) <- paste0("combined.", colnames(allord))
+colnames(allord)[1] <- "GeneID"
+
+merged <- Reduce(function(x, y) merge(x, y, all = TRUE, by = "GeneID"), list(femaleord, allord))
+write.csv(merged, file = file.path(path, group, paste0(group, ".all_analyses_combined.txt")))
+
+```
+
+#Annotation
+```{r}
+merged <- read.csv(file.path(path, group, "DRGL4.all_analyses_combined.txt"))
+merged$gene_name <- rowData(dds.full)[match(merged$GeneID, rowData(dds.full)$gene_id), "gene_name"]
+
+#IBS biomarkers
+biomarkers <- read.csv(here("data", "IBS_biomarkers.txt"), sep = ",", header = TRUE)
+merged$IBS_biomarker <- biomarkers[match(merged$gene_name, biomarkers$Gene), "Type"]
+
+#Neuronal genes
+source("/data/users/sushmanagaraj/ref/genelists/Brown_Goff_hand-curated_gene_sets_2018.R")
+
+gap_junctions <- c("Gja1", "Gja3", "Gja4", "Gja5", "Gja8", "Gja10", "Gjb1", "Gjb2", "Gjb3", "Gjb4", "Gjb5", "Gjb6", "Gjc1", "Gjc2", "Gjc3", "Gjd2", "Gjd3", "Gjd4", "Gje1")
+purine_signalling <- c("P2ry1", "P2ry10", "P2ry12", "P2ry13", "P2ry14", "P2ry2", "P2ry4", "P2ry6", "P2rx1", "P2rx2", "P2rx3", "P2rx4", "P2rx5", "P2rx6", "P2rx7", "Adora1", "Adora2a", "Adora2b", "Adora3")
+
+sets <- list(All_channels, Amine_receptors, Axon_genes, CaChannels, ClChannels, Gage_FOS_dn, Gage_FOS_up, GluR_genes, GPCRs, Gray.activity.genes, Ion_channels, K_channels_Mouse, KChannel_reg_subunits, KChannels, Ligand_gated_ion_channels, Ligand_gated_ion_channels_HUGO, LTP_genes, Na_channels_Mouse, NaChannels, Neuropeptides, Other_receptors, Peptide_receptors, Synaptic_transmission_genes, VIP_calcitonin, Voltage_gated_channels_HUGO, gap_junctions, purine_signalling)
+names(sets) <- c("All_channels", "Amine_receptors", "Axon_genes", "CaChannels", "ClChannels", "Gage_FOS_dn", "Gage_FOS_up", "GluR_genes", "GPCRs", "Gray.activity.genes", "Ion_channels", "K_channels_Mouse", "KChannel_reg_subunits", "KChannels", "Ligand_gated_ion_channels", "Ligand_gated_ion_channels_HUGO", "LTP_genes", "Na_channels_Mouse", "NaChannels", "Neuropeptides", "Other_receptors", "Peptide_receptors", "Synaptic_transmission_genes", "VIP_calcitonin", "Voltage_gated_channels_HUGO", "gap_junctions", "purine_signalling")
+
+neuronal.temp1 <- unlist(sets)
+neuronal.df <- as.data.frame(neuronal.temp1)
+neuronal.df$Annotation <- rownames(neuronal.df)
+neuronal.df$Annotation <- gsub("[[:digit:]]+", "", neuronal.df$Annotation)
+neuronal.df2 <- aggregate(data=neuronal.df,Annotation~.,FUN=paste,collapse=",")
+
+merged$Neuronal_gene <- neuronal.df2[match(merged$gene_name, neuronal.df2$neuronal.temp1), "Annotation"]
+
+library(biomaRt)
+ensembl = useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl")
+genedesc <- getBM(attributes=c('external_gene_name','description'), filters = 'external_gene_name', values = merged$gene_name, mart =ensembl)
+merged$description <- genedesc[match(merged$gene_name, genedesc$external_gene_name), "description"]
+
+write.table(merged, file = file.path(path, group, "DRGL4.all_analyses_combined.annotations.txt"), sep = "\t")
+```

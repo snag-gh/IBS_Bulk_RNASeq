@@ -1,0 +1,229 @@
+---
+title: "EDA DRG.T12.Males"
+author: "Sushma Nagaraj"
+date: "7/6/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+source("/home/sushmanagaraj/src/R_code/RNASeq/IBS_GABA/functions.R")
+library(here)
+library(reshape2)
+library(ggplot2)
+library(DESeq2)
+library(edgeR)
+library(genefilter)
+library(AnnotationHub)
+```
+
+```{r data, echo=TRUE, warning=FALSE, message=FALSE}
+coldata <- read.csv(here("data", "sample_table.csv"), header = TRUE, stringsAsFactors = FALSE)
+coldata$source <- factor(coldata$source)
+coldata$group <- factor(coldata$group)
+coldata$Mice <- factor(coldata$Mice)
+coldata$Cage <- factor(coldata$Cage)
+coldata$Gender <- factor(coldata$Gender)
+coldata$Category <- factor(coldata$Category)
+coldata$DOB <- factor(coldata$DOB)
+coldata$Age.at.Sac <- factor(coldata$Age.at.Sac)
+coldata$Sac.Date <- factor(coldata$Sac.Date)
+coldata$Extraction.Date <- factor(coldata$Extraction.Date)
+
+counts <- read.table(here("data", "readcount_genename.xls"), header = TRUE, stringsAsFactors = FALSE)
+row.names(counts) <- counts$geneID
+countdata <- counts[,2:99]
+genedata <- counts[,c(1,100:107)]
+sample.ord <- match(colnames(countdata), coldata$Sample)
+coldata.ord <- coldata[sample.ord,]
+all(coldata.ord$Sample == colnames(countdata))
+all(row.names(genedata) == row.names(countdata))
+```
+
+#Boxplot and density plot
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+#drg.t12.m <- which(coldata.ord$source == c("DRG T12-L2") & coldata.ord$Gender == "M")
+#drg.t12.m <- which(coldata.ord$source == c("DRG T12-L2"))
+coldata.ord$Gender2 <- coldata.ord$Gender
+#coldata.ord$Gender2[coldata.ord$Sample %in% c("A138", "A139")] <- "F"
+drg.t12.m <- which(coldata.ord$source == c("PROXIMAL COLON") & coldata.ord$Gender == "F")
+coldata.drg.t12.m <- coldata.ord[drg.t12.m,]
+countdata.drg.t12.m <- countdata[,drg.t12.m]
+
+keep <- rowSums(countdata.drg.t12.m) > 1
+filtered_counts <- countdata.drg.t12.m[keep, ]
+
+df <- melt(countdata.drg.t12.m, variable.name = "Samples")
+df$group <- coldata.drg.t12.m[match(df$Samples, coldata.drg.t12.m$Sample), "group"]
+df$gender <- coldata.drg.t12.m[match(df$Samples, coldata.drg.t12.m$Sample), "Gender"]
+
+df2 <- melt(filtered_counts, variable.name = "Samples")
+df2$group <- coldata.drg.t12.m[match(df2$Samples, coldata.drg.t12.m$Sample), "group"]
+
+ggplot(df, aes(x = Samples, y = log2(value + 1), fill = group)) + geom_boxplot() + ylab(expression(log[2](count + 1))) + ggtitle("DRG.T12 Males filtered counts")
+ggplot(df2, aes(x = Samples, y = log2(value + 1), fill = group)) + geom_boxplot() + ylab(expression(log[2](count + 1))) + ggtitle("Proximal Colon Females filtered counts (rowsums > 1)")
+
+ggplot(df, aes(x = log2(value + 1), colour = Samples, fill = Samples)) + geom_density(alpha = 0.2, size = 1.25) + facet_wrap(~ group) + xlab(expression(log[2](count + 1)))
+
+ddsMat.drg.t12.m <- DESeqDataSetFromMatrix(countData = countdata.drg.t12.m, colData = coldata.drg.t12.m, design = ~ group)
+keep <- rowSums(counts(ddsMat.drg.t12.m)) > 1
+ddsMat.drg.t12.m <- ddsMat.drg.t12.m[keep,]
+ddsMat.drg.t12.m <- estimateSizeFactors(ddsMat.drg.t12.m)
+dat <- counts(ddsMat.drg.t12.m, normalized = TRUE)
+
+#log2norm <- log2(dat + 1)
+#pdf(here("DRG.T12", "troubleshooting", "qqplots_of_log2norm_counts.pdf"))
+#plot(density(log2norm[,1]))
+#for (i in c(1:8)) {
+#  qqnorm(log2norm[,i])
+#  qqline(log2norm[,i])
+#}
+#dev.off()
+```
+
+
+```{r}
+ddsMat.drg.t12.m <- DESeq(ddsMat.drg.t12.m)
+res <- results(ddsMat.drg.t12.m)
+hist(res$pvalue)
+summary(res)
+
+
+#Batch correction with SVA
+mod <- model.matrix(~ group, colData(ddsMat.drg.t12.m))
+mod0 <- model.matrix(~ 1, colData(ddsMat.drg.t12.m))
+
+n.sv = num.sv(dat, mod, method="leek")
+#> n.sv
+#[1] 13
+svobj3 <- svaseq(dat, mod, mod0, n.sv = 7)
+
+clean_counts <- cleanY(dat.drg.l4, mod, svobj3$sv[,1:12])
+p.clean <- pca(clean_counts, metadata = colData(ddsMat.drg.l4), removeVar = 0.3)
+pdf(here("DRG.L4", "plots", "PCA.DRG.L4.Corrected.pdf"))
+biplot(p.clean, colby = "group", lab = p.clean$metadata$Sample, labSize = 3, pointSize = 3, legendPosition = 'right', title = "DRG L4-S2 Corrected with SVA using 12 surrogate variables")
+dev.off()
+
+ddsMat.sva <- ddsMat.drg.t12.m
+var <- paste0("SV", 1:7)
+sv <- as.data.frame(svobj3$sv)
+colnames(sv) <- var
+colData(ddsMat.sva) <- cbind(colData(ddsMat.sva), sv)
+design(ddsMat.sva) <- ~ SV1 + SV2 + SV3 + SV4 + SV5 + SV6 + SV7 + group
+ddsMat.sva <- DESeq(ddsMat.sva)
+
+res3 <- results(ddsMat.sva)
+summary(res3)
+
+hist(res3$pvalue)
+
+```
+
+#Test gender
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+#ygenes <- read.table(here("data", "chrY_genes.txt"))
+drg.t12 <- which(coldata.ord$source == c("PROXIMAL COLON"))
+checkY(drg.t12, "PROXIMAL COLON")
+```
+
+#T test
+```{r ttest, echo=TRUE, warning=FALSE, message=FALSE}
+#T test
+log2norm <- log2(dat + 1)
+group <- coldata.drg.t12.m$group
+tt <- rowttests(log2norm, group)
+hist(tt$p.value, main = "DRG.T12 Males rowttests")
+```
+
+#Wilcox test
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+#Wilcox test
+tdat <- t(dat)
+tdat <- cbind(coldata.drg.t12.m$group, tdat)
+colnames(tdat)[1] <- "group"
+tdat <- as.data.frame(tdat)
+wt <- lapply(tdat[,-1], function(x) wilcox.test(x ~ tdat$group))
+pval <- numeric()
+for(i in wt){
+  j <- i$p.value
+  pval <- c(pval, j)
+}
+names(pval) <- names(wt)
+hist(pval)
+```
+
+#EdgeR
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+#edgeR
+group <- coldata.drg.t12.m$group
+dgList <- DGEList(counts = countdata.drg.t12.m, genes = row.names(countdata.drg.t12.m), group = group)
+keep <- filterByExpr(dgList)
+dgList <- dgList[keep,,keep.lib.sizes = FALSE]
+dgList <- calcNormFactors(dgList)
+design <- model.matrix(~group)
+dgList <- estimateDisp(dgList, design)
+fit <- glmQLFit(dgList, design)
+qlf <- glmQLFTest(fit, coef = 2)
+edgeR_result <- topTags(qlf, n = 14533)
+
+hist(edgeR_result$table$PValue)
+```
+
+#Limma Voom
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+d0 <- DGEList(countdata.drg.t12.m)
+d0 <- calcNormFactors(d0)
+cutoff <- 1
+cutoff <- 0.5
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop, ]
+group <- coldata.drg.t12.m$group
+plotMDS(d, col = as.numeric(group))
+mm <- model.matrix(~0 + group)
+y <- voom(d, mm, plot = T)
+#tmp <- voom(d0, mm, plot = T)
+
+fit <- lmFit(y, mm)
+head(coef(fit))
+contr <- makeContrasts(groupCONTROL - groupIBS, levels = colnames(coef(fit)))
+contr
+tmp <- contrasts.fit(fit, contr)
+efit <- eBayes(tmp)
+summary(decideTests(efit))
+#head(tmp)
+top.table <- topTable(efit, sort.by = "P", n = Inf)
+hist(top.table$P.Value)
+
+#Limma without voom, using log2normalized counts.
+fit <- lmFit(log2norm, mm)
+head(coef(fit))
+tmp <- contrasts.fit(fit, contr)
+efit <- eBayes(tmp)
+summary(decideTests(efit))
+top.table <- topTable(efit, sort.by = "P", n = Inf)
+hist(top.table$P.Value)
+```
+
+
+```{r}
+#SAMseq
+#set.seed(100)
+#mu <- matrix(100, 1000, 20)
+#mu[1:100, 11:20] <- 200
+#mu <- scale(mu, center=FALSE, scale=runif(20, 0.5, 1.5))
+#x1 <- matrix(rpois(length(mu), mu), 1000, 20)
+#y <- c(rep(1, 10), rep(2, 10))
+
+#x <- countdata.drg.t12.m
+#colnames(x) <- c(1,1,1,2,2,2,2,1,1,2)
+#y <- c(1,1,1,2,2,2,2,1,1,2)
+#samfit <- SAMseq(x, y, resp.type = "Two class unpaired") 
+#print(samfit)
+#plot(samfit)
+
+#Check pvalue on the DE analysis that Novogene performed for us.
+novo <- read.table(here("data", "M_I_DT12vsM_C_DT12_DEG.xls"), header = TRUE)
+pdf(here("DRG.T12", "troubleshooting", "Novogene.analysis.Males.pvalue_histogram.pdf"))
+hist(novo$pvalue, breaks = 0:20/20, col = "grey50", border = "white", main = "DRG.T12.males Novogene DEG analysis")
+dev.off()
+```
